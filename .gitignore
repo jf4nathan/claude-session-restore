@@ -12,3 +12,6 @@ Thumbs.db
 sessions.json
 pane-map/
 *.log
+
+# Session handoff notes (local only)
+.handoff/
