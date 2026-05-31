@@ -3,6 +3,21 @@
 # Exports: Save-ClaudeSession (claude-save), Restore-ClaudeSession (claude-restore),
 #          Get-ClaudeSession. Operates entirely on ~/.claude/ — no install-path knowledge.
 
+function Get-PaneMappedId {
+    # The session UUID the SessionStart hook recorded for this pane, or $null
+    # ($null if no/empty map file, or the map predates the current WezTerm generation).
+    param([int]$PaneId, $MuxOrigin, [string]$ClaudeRoot)
+    $mapFile = Join-Path (Join-Path $ClaudeRoot 'pane-map') "$PaneId.session"
+    if (-not (Test-Path -LiteralPath $mapFile)) { return $null }
+    if ($MuxOrigin -and (Get-Item -LiteralPath $mapFile).LastWriteTime -lt $MuxOrigin) {
+        Write-Warning ("  pane {0}: pane-map is stale (predates current WezTerm); ignoring, will guess by cwd/title." -f $PaneId)
+        return $null
+    }
+    $sessionId = (Get-Content -LiteralPath $mapFile -Raw -ErrorAction SilentlyContinue).Trim()
+    if (-not $sessionId) { return $null }
+    return $sessionId
+}
+
 function Resolve-PaneEntries {
     param(
         [object[]]$WindowPanes,
@@ -13,6 +28,14 @@ function Resolve-PaneEntries {
     # Build per-CWD session lists (slug, mtime desc). Used to disambiguate when
     # a pane's title isn't a real session slug.
     $cwdSessions = @{}
+
+    # Reserve every session a (non-stale) pane-map claims in this window, so cwd-guessing
+    # can never grab a session another pane legitimately owns (prevents N-panes-on-1-session).
+    $reserved = @{}
+    foreach ($wp in $WindowPanes) {
+        $rid = Get-PaneMappedId -PaneId $wp.pane_id -MuxOrigin $MuxOrigin -ClaudeRoot $ClaudeRoot
+        if ($rid) { $reserved[$rid] = $true }
+    }
 
     function Get-CwdSessions {
         param([string]$Cwd)
@@ -61,13 +84,15 @@ function Resolve-PaneEntries {
     function Use-CwdSession {
         param([string]$Cwd, [string]$PreferredSlug)
         $list = Get-CwdSessions -Cwd $Cwd
-        if ($list.Count -eq 0) { return $null }
+        # Exclude sessions reserved by another pane's pane-map (prevents collapse onto them).
+        $cands = @($list | Where-Object { -not $reserved.ContainsKey($_.SessionId) })
+        if ($cands.Count -eq 0) { return $null }
         $picked = $null
         if ($PreferredSlug) {
-            $picked = $list | Where-Object { $_.Slug -eq $PreferredSlug } | Select-Object -First 1
+            $picked = $cands | Where-Object { $_.Slug -eq $PreferredSlug } | Select-Object -First 1
         }
         if (-not $picked) {
-            $picked = $list[0]
+            $picked = $cands[0]
         }
         $cwdSessions[$Cwd] = @($list | Where-Object { $_.SessionId -ne $picked.SessionId })
         return $picked
@@ -102,38 +127,6 @@ function Resolve-PaneEntries {
         if (-not $homeCwd) { return $null }
 
         return [PSCustomObject]@{ SessionId = $SessionId; Slug = $slugVal; Cwd = $homeCwd }
-    }
-
-    # Pane-map lookup: returns the session the SessionStart hook recorded for this pane —
-    # an exact, deterministic mapping — resolved to its real home dir. Marks the session
-    # consumed in its HOME cwd list so the most-recent fallback can't double-assign it to
-    # another pane that happens to sit in that same dir. $null if no mapping or the mapped
-    # session's jsonl no longer exists anywhere.
-    function Use-PaneMappedSession {
-        param([int]$PaneId)
-        $mapFile = Join-Path (Join-Path $ClaudeRoot 'pane-map') "$PaneId.session"
-        if (-not (Test-Path -LiteralPath $mapFile)) { return $null }
-
-        # Reject a map file from a previous WezTerm generation (reused pane ID): if it
-        # was last written before the current mux started, the pane it described is gone.
-        if ($muxOrigin -and (Get-Item -LiteralPath $mapFile).LastWriteTime -lt $muxOrigin) {
-            Write-Warning ("  pane {0}: pane-map is stale (predates current WezTerm); ignoring, will guess by cwd/title." -f $PaneId)
-            return $null
-        }
-
-        $sessionId = (Get-Content -LiteralPath $mapFile -Raw -ErrorAction SilentlyContinue).Trim()
-        if (-not $sessionId) { return $null }
-
-        $sess = Get-SessionHome -SessionId $sessionId
-        if (-not $sess) { return $null }
-
-        # Consume from the session's home cwd list (best-effort; cache is keyed by cwd
-        # string, so a differently-spelled cwd elsewhere may not see the consumption).
-        $list = Get-CwdSessions -Cwd $sess.Cwd
-        if ($list.Count -gt 0) {
-            $cwdSessions[$sess.Cwd] = @($list | Where-Object { $_.SessionId -ne $sessionId })
-        }
-        return $sess
     }
 
     # Group by tab_id, preserve tab insertion order
@@ -196,14 +189,24 @@ function Resolve-PaneEntries {
             # terminal cwd); otherwise it's the pane's own cwd.
             $picked = $null
             $resumeCwd = $cwd
+            $mappedUnresolved = $false
             if (-not $looksLikeShell) {
-                # Tier-a (pane-map): an exact, recorded mapping for a live Claude pane —
-                # honour it regardless of whether the session lives under this pane's cwd.
-                $picked = Use-PaneMappedSession -PaneId $p.pane_id
-                if ($picked) {
-                    if ($picked.Cwd) { $resumeCwd = $picked.Cwd }
+                $mid = Get-PaneMappedId -PaneId $p.pane_id -MuxOrigin $MuxOrigin -ClaudeRoot $ClaudeRoot
+                if ($mid) {
+                    $sess = Get-SessionHome -SessionId $mid
+                    if ($sess) {
+                        # Tier-1: exact pane-map hit, resolved to its real home dir.
+                        $picked = $sess
+                        if ($picked.Cwd) { $resumeCwd = $picked.Cwd }
+                        $hlist = Get-CwdSessions -Cwd $sess.Cwd
+                        if ($hlist.Count -gt 0) { $cwdSessions[$sess.Cwd] = @($hlist | Where-Object { $_.SessionId -ne $mid }) }
+                    } else {
+                        # GUARD: mapped to a session with no jsonl (empty startup session).
+                        # Do NOT cwd-guess (that collapses onto an unrelated session). Open fresh.
+                        $mappedUnresolved = $true
+                    }
                 } elseif ($cwd) {
-                    # Tier-b/c: no pane-map — guess by title-slug / most-recent in this cwd.
+                    # No pane-map: guess by title-slug / most-recent in this cwd (reserved excluded).
                     $picked = Use-CwdSession -Cwd $cwd -PreferredSlug $title
                 }
             }
@@ -216,17 +219,15 @@ function Resolve-PaneEntries {
             if ($picked) {
                 $entry.resume = $picked.SessionId
                 if ($picked.Slug) { $entry.resume_slug = $picked.Slug }
-            } elseif ($looksLikeShell) {
-                # No session to resume; open a fresh claude rather than --continue
-                # (which would silently grab this cwd's newest unrelated session).
+            } elseif ($looksLikeShell -or $mappedUnresolved) {
+                # Shell (Claude exited) or a pane-mapped-but-unpersisted session: open fresh,
+                # never --continue (which would grab this cwd's newest unrelated session).
                 $entry.fresh = $true
             } else {
-                # Couldn't pin a specific session. If this cwd still has an unassigned
-                # session, --continue (newest) is a defensible guess. But if every
-                # session here is already claimed by another pane, --continue would
-                # just reopen one of them — N panes collapsing onto one session — so
-                # open fresh instead.
-                $remaining = @(Get-CwdSessions -Cwd $cwd)
+                # Couldn't pin a specific session. --continue only if this cwd has an
+                # unassigned, non-reserved session; otherwise every candidate belongs to
+                # another pane, so open fresh instead.
+                $remaining = @(Get-CwdSessions -Cwd $cwd | Where-Object { -not $reserved.ContainsKey($_.SessionId) })
                 if ($remaining.Count -gt 0) { $entry.continue = $true } else { $entry.fresh = $true }
             }
             $paneEntries += $entry
