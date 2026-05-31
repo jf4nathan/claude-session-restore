@@ -84,7 +84,9 @@ For a `resume`-mode pane that has `worktree` (skip for fresh/continue):
 
 - Spawn cwd unchanged (root / `cleanCwd`).
 - **Banner:** inject a `Write-Host` line into the encoded inner pwsh command **before**
-  `. $PROFILE`, naming the worktree leaf and pointing at `/switch-worktree`.
+  `. $PROFILE`, naming the worktree leaf and pointing at `/switch-worktree`. ASCII-only
+  (`[worktree] …`) — the spawned pane's output encoding is not guaranteed, and embedding raw
+  glyphs via the editor risks corruption.
 - **One-shot marker:** write `~/.claude/worktree-restore/<session-id>` containing the worktree
   path. `<session-id>` is the `resume` id.
 - **Re-check at restore time:** if `worktree` no longer exists on disk (pruned since save),
@@ -94,7 +96,13 @@ For a `resume`-mode pane that has `worktree` (skip for fresh/continue):
 
 ### 4. Hook side (`hooks/Update-PaneMap.ps1`)
 
-After writing the pane-map, check `~/.claude/worktree-restore/<session_id>`:
+The marker check runs **independent of `WEZTERM_PANE`** (it concerns the session, not the pane),
+after parsing `session_id`; the pane-map write stays gated on `WEZTERM_PANE`. The marker dir is
+`~/.claude/worktree-restore`, with a `CLAUDE_WORKTREE_MARKER_DIR` override scoped to **that dir
+only** — never the pane-map or log paths, so a stray env var can't relocate the pane-map and break
+Save resolution. (Used by tests; `$HOME` does not relocate via env on Windows pwsh.)
+
+Check `~/.claude/worktree-restore/<session_id>`:
 
 - if present: emit `hookSpecificOutput.additionalContext` (instead of the bare `{}`) stating
   the session last worked in worktree `<path>`, that the terminal launched from root so

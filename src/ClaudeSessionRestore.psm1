@@ -18,6 +18,61 @@ function Get-PaneMappedId {
     return $sessionId
 }
 
+function Test-IsWorktree {
+    # True iff $Path is a LINKED git worktree (not the main working tree). A linked worktree's
+    # --git-dir (.git/worktrees/<name>) differs from its --git-common-dir (the main .git); for
+    # the primary working tree the two resolve to the same path. Falls back to a '\.worktrees\'
+    # path heuristic when git is unavailable or $Path isn't a git repo. Best-effort: any error
+    # means "not a worktree" so detection never blocks a save.
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    $heuristic = ($Path -match '[\\/]\.worktrees[\\/]')
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $heuristic }
+    try {
+        $gitDir    = (& git -C $Path rev-parse --git-dir 2>$null)
+        $commonDir = (& git -C $Path rev-parse --git-common-dir 2>$null)
+    } catch { return $heuristic }
+    if (-not $gitDir -or -not $commonDir) { return $heuristic }   # not a git repo
+    $resolve = {
+        param($p, $base)
+        if ([System.IO.Path]::IsPathRooted($p)) { [System.IO.Path]::GetFullPath($p) }
+        else { [System.IO.Path]::GetFullPath((Join-Path $base $p)) }
+    }
+    return ((& $resolve $gitDir $Path) -ne (& $resolve $commonDir $Path))
+}
+
+function Get-WorktreeBanner {
+    # The notice printed in a restored pane before Claude launches, when the resumed session last
+    # worked in a git worktree. Claude resumes from the repo ROOT (so --resume can find the session);
+    # this banner tells the user where the work actually was and how to get back. ASCII-only on
+    # purpose — the spawned pane's output encoding is not guaranteed.
+    param([string]$WorktreePath, [bool]$Exists)
+    $leaf = Split-Path -Leaf $WorktreePath
+    if ($Exists) {
+        return ("[worktree] This session was last working in '{0}'. It resumed from the repo root so --resume could find it.`n[worktree] Run /switch-worktree to re-enter the worktree." -f $leaf)
+    }
+    return ("[worktree] This session was last working in '{0}', which is no longer present. Resumed from the repo root." -f $leaf)
+}
+
+function Set-WorktreeMarker {
+    # Write a one-shot marker the SessionStart hook reads to offer /switch-worktree on resume.
+    # Keyed by session id so the hook fires only for this restored pane. Prunes markers older than
+    # 24h (a marker normally lives seconds — written at restore, consumed at the next SessionStart).
+    # Returns the marker path, or $null on failure (best-effort; never blocks restore).
+    param([string]$ClaudeRoot, [string]$SessionId, [string]$WorktreePath)
+    try {
+        $dir = Join-Path $ClaudeRoot 'worktree-restore'
+        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        $cutoff = (Get-Date).AddHours(-24)
+        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        $marker = Join-Path $dir $SessionId
+        Set-Content -LiteralPath $marker -Value $WorktreePath -NoNewline -ErrorAction Stop
+        return $marker
+    } catch { return $null }
+}
+
 function Resolve-PaneEntries {
     param(
         [object[]]$WindowPanes,
@@ -102,7 +157,10 @@ function Resolve-PaneEntries {
     # plus the launch cwd recorded inside that file. A pane's terminal cwd often differs
     # from where its Claude session was launched (e.g. the pane cd'd into a plugin dir, or
     # an MCP server changed cwd), so we can't assume the session lives under the pane's cwd.
-    # Returns @{ SessionId; Slug; Cwd } (Cwd = the real launch dir to resume from), or $null.
+    # Returns @{ SessionId; Slug; Cwd; LastCwd }, or $null. Cwd = the real launch dir to resume
+    # from (first cwd recorded — where Claude Code indexes the session). LastCwd = the cwd recorded
+    # on the last entry that has one — where the session was actually working when it ended (e.g. a
+    # git worktree entered mid-session via EnterWorktree). LastCwd defaults to Cwd when unchanged.
     function Get-SessionHome {
         param([string]$SessionId)
         if ($SessionId -notmatch '^[0-9a-fA-F-]{36}$') { return $null }
@@ -126,7 +184,24 @@ function Resolve-PaneEntries {
         } finally { $reader.Dispose() }
         if (-not $homeCwd) { return $null }
 
-        return [PSCustomObject]@{ SessionId = $SessionId; Slug = $slugVal; Cwd = $homeCwd }
+        # LastCwd: scan the tail backwards and take the first entry whose TOP-LEVEL "cwd" parses.
+        # Parse each line as JSON (not regex) so a "cwd":"..." substring embedded in tool output or
+        # message text can't be mistaken for the session's working directory. A generous tail covers
+        # trailing cwd-less envelope lines; if none parse, LastCwd stays = homeCwd.
+        $lastCwd = $homeCwd
+        try {
+            $tail = Get-Content -LiteralPath $hit.FullName -Tail 200 -ErrorAction Stop
+            for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+                $obj = $null
+                try { $obj = $tail[$i] | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if (($obj.PSObject.Properties.Name -contains 'cwd') -and $obj.cwd) {
+                    $lastCwd = [string]$obj.cwd   # ConvertFrom-Json already unescaped backslashes
+                    break
+                }
+            }
+        } catch { }
+
+        return [PSCustomObject]@{ SessionId = $SessionId; Slug = $slugVal; Cwd = $homeCwd; LastCwd = $lastCwd }
     }
 
     # Group by tab_id, preserve tab insertion order
@@ -189,6 +264,7 @@ function Resolve-PaneEntries {
             # terminal cwd); otherwise it's the pane's own cwd.
             $picked = $null
             $resumeCwd = $cwd
+            $paneWorktree = $null
             $mappedUnresolved = $false
             if (-not $looksLikeShell) {
                 $mid = Get-PaneMappedId -PaneId $p.pane_id -MuxOrigin $MuxOrigin -ClaudeRoot $ClaudeRoot
@@ -198,6 +274,15 @@ function Resolve-PaneEntries {
                         # Tier-1: exact pane-map hit, resolved to its real home dir.
                         $picked = $sess
                         if ($picked.Cwd) { $resumeCwd = $picked.Cwd }
+                        # If the session ended in a git worktree distinct from where it's indexed,
+                        # record it. Resume still spawns from the home/root cwd (so --resume finds the
+                        # session — Claude Code's resume is cwd-bound); restore surfaces the worktree
+                        # and offers /switch-worktree rather than landing the user in the wrong dir.
+                        if ($sess.LastCwd -and $sess.Cwd -and
+                            ($sess.LastCwd.TrimEnd('\','/') -ne $sess.Cwd.TrimEnd('\','/')) -and
+                            (Test-IsWorktree -Path $sess.LastCwd)) {
+                            $paneWorktree = $sess.LastCwd
+                        }
                         $hlist = Get-CwdSessions -Cwd $sess.Cwd
                         if ($hlist.Count -gt 0) { $cwdSessions[$sess.Cwd] = @($hlist | Where-Object { $_.SessionId -ne $mid }) }
                     } else {
@@ -219,6 +304,7 @@ function Resolve-PaneEntries {
             if ($picked) {
                 $entry.resume = $picked.SessionId
                 if ($picked.Slug) { $entry.resume_slug = $picked.Slug }
+                if ($paneWorktree) { $entry.worktree = $paneWorktree }
             } elseif ($looksLikeShell -or $mappedUnresolved) {
                 # Shell (Claude exited) or a pane-mapped-but-unpersisted session: open fresh,
                 # never --continue (which would grab this cwd's newest unrelated session).
@@ -504,6 +590,21 @@ function Restore-ClaudeSession {
                 'fresh'    { "" }   # no env var; bare claude will run via auto-launch
             }
             $pwshCmd = if ($envSetup) { "$envSetup; . `$PROFILE" } else { ". `$PROFILE" }
+
+            # Worktree-aware resume: a session that last worked in a git worktree still resumes from
+            # the repo root (so --resume can find it — Claude Code's resume is cwd-bound). Print a
+            # banner naming the worktree and drop a one-shot marker so the SessionStart hook can offer
+            # /switch-worktree. If the worktree was pruned since save, show a degraded banner and write
+            # no marker (no offer). Marker write is skipped on -DryRun to keep dry runs side-effect-free.
+            if ($effectiveMode -eq 'resume' -and $pane.worktree) {
+                $wtExists = Test-Path -LiteralPath $pane.worktree
+                $banner = Get-WorktreeBanner -WorktreePath $pane.worktree -Exists $wtExists
+                $safeBanner = $banner -replace "'", "''"
+                $pwshCmd = "Write-Host '$safeBanner' -ForegroundColor Yellow; " + $pwshCmd
+                if ($wtExists -and -not $DryRun) {
+                    Set-WorktreeMarker -ClaudeRoot (Join-Path $HOME '.claude') -SessionId $resumeName -WorktreePath $pane.worktree | Out-Null
+                }
+            }
 
             # CRITICAL: pass the command as -EncodedCommand (base64 UTF-16 LE).
             # PowerShell 5.1's native-command argument passing mangles strings that
