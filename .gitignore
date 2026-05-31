@@ -1,0 +1,14 @@
+# Editor / OS cruft
+*.bak
+*.bak.*
+Thumbs.db
+.DS_Store
+
+# PowerShell module build/cruft (guard for public contributors)
+*.psd1.bak
+
+# This tool's runtime data lives under ~/.claude/, never in the repo.
+# Listed here only as a guard in case anything is ever copied in by mistake.
+sessions.json
+pane-map/
+*.log
