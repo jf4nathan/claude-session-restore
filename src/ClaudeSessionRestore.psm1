@@ -3,59 +3,12 @@
 # Exports: Save-ClaudeSession (claude-save), Restore-ClaudeSession (claude-restore),
 #          Get-ClaudeSession. Operates entirely on ~/.claude/ — no install-path knowledge.
 
-function Save-ClaudeSession {
-    [CmdletBinding()]
+function Resolve-PaneEntries {
     param(
-        [string]$Profile = "default",
-        [string]$ManifestPath = "$HOME\.claude\sessions.json",
-        [int]$WindowId = -1   # -1 means: use the window with the active pane
+        [object[]]$WindowPanes,
+        $MuxOrigin,
+        [string]$ClaudeRoot = (Join-Path $HOME '.claude')
     )
-
-    if (-not (Get-Command wezterm.exe -ErrorAction SilentlyContinue)) {
-        Write-Error "wezterm.exe not found on PATH."
-        return
-    }
-
-    $listJson = & wezterm.exe cli list --format json 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $listJson) {
-        Write-Error "wezterm cli list failed. Is WezTerm running?"
-        return
-    }
-
-    $panes = $listJson | ConvertFrom-Json
-    if (-not $panes) {
-        Write-Error "wezterm cli list returned no panes."
-        return
-    }
-
-    # WezTerm reuses pane IDs across restarts, but the SessionStart-hook pane-map files
-    # (~/.claude/pane-map/<id>.session) persist on disk. A map file written by a PRIOR
-    # WezTerm generation points at a long-dead session, so trusting it would resume the
-    # wrong session with false confidence. Anchor "current" to the mux that owns pane IDs:
-    # the earliest-started wezterm-mux-server (if running) or wezterm-gui process. A map
-    # file older than that mux belongs to a previous generation and is ignored.
-    $muxOrigin = $null
-    try {
-        $muxOrigin = (Get-Process wezterm-mux-server, wezterm-gui -ErrorAction SilentlyContinue |
-            Sort-Object StartTime | Select-Object -First 1).StartTime
-    } catch { $muxOrigin = $null }
-
-    # Pick window: explicit, or the one containing the active pane
-    if ($WindowId -lt 0) {
-        $activePane = $panes | Where-Object { $_.is_active } | Select-Object -First 1
-        if (-not $activePane) {
-            $WindowId = ($panes | Select-Object -First 1).window_id
-        } else {
-            $WindowId = $activePane.window_id
-        }
-    }
-
-    $otherWindows = $panes | Where-Object { $_.window_id -ne $WindowId } | Select-Object -ExpandProperty window_id -Unique
-    if ($otherWindows) {
-        Write-Warning ("Saving window {0} only. Other windows ignored: {1}" -f $WindowId, ($otherWindows -join ', '))
-    }
-
-    $windowPanes = $panes | Where-Object { $_.window_id -eq $WindowId }
 
     # Build per-CWD session lists (slug, mtime desc). Used to disambiguate when
     # a pane's title isn't a real session slug.
@@ -73,7 +26,7 @@ function Save-ClaudeSession {
         # two dashes for colon+backslash). Trimming produced 'Z-' and the dir never matched.
         # The old class '[:\\/ ]' also missed '.', so '.claude' mismatched ('-.claude' vs '--claude').
         $projectSlug = ($resolved.Path -replace '[^a-zA-Z0-9]', '-')
-        $projectDir = Join-Path "$HOME\.claude\projects" $projectSlug
+        $projectDir = Join-Path (Join-Path $ClaudeRoot 'projects') $projectSlug
         if (-not (Test-Path -LiteralPath $projectDir)) {
             $cwdSessions[$Cwd] = @(); return @()
         }
@@ -128,7 +81,7 @@ function Save-ClaudeSession {
     function Get-SessionHome {
         param([string]$SessionId)
         if ($SessionId -notmatch '^[0-9a-fA-F-]{36}$') { return $null }
-        $hit = Get-ChildItem -Path (Join-Path "$HOME\.claude\projects" "*\$SessionId.jsonl") -ErrorAction SilentlyContinue |
+        $hit = Get-ChildItem -Path (Join-Path (Join-Path $ClaudeRoot 'projects') "*\$SessionId.jsonl") -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if (-not $hit) { return $null }
 
@@ -158,7 +111,7 @@ function Save-ClaudeSession {
     # session's jsonl no longer exists anywhere.
     function Use-PaneMappedSession {
         param([int]$PaneId)
-        $mapFile = "$HOME\.claude\pane-map\$PaneId.session"
+        $mapFile = Join-Path (Join-Path $ClaudeRoot 'pane-map') "$PaneId.session"
         if (-not (Test-Path -LiteralPath $mapFile)) { return $null }
 
         # Reject a map file from a previous WezTerm generation (reused pane ID): if it
@@ -293,6 +246,64 @@ function Save-ClaudeSession {
         }
     }
 
+    return $tabs
+}
+
+function Save-ClaudeSession {
+    [CmdletBinding()]
+    param(
+        [string]$Profile = "default",
+        [string]$ManifestPath = "$HOME\.claude\sessions.json",
+        [int]$WindowId = -1   # -1 means: use the window with the active pane
+    )
+
+    if (-not (Get-Command wezterm.exe -ErrorAction SilentlyContinue)) {
+        Write-Error "wezterm.exe not found on PATH."
+        return
+    }
+
+    $listJson = & wezterm.exe cli list --format json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $listJson) {
+        Write-Error "wezterm cli list failed. Is WezTerm running?"
+        return
+    }
+
+    $panes = $listJson | ConvertFrom-Json
+    if (-not $panes) {
+        Write-Error "wezterm cli list returned no panes."
+        return
+    }
+
+    # WezTerm reuses pane IDs across restarts, but the SessionStart-hook pane-map files
+    # (~/.claude/pane-map/<id>.session) persist on disk. A map file written by a PRIOR
+    # WezTerm generation points at a long-dead session, so trusting it would resume the
+    # wrong session with false confidence. Anchor "current" to the mux that owns pane IDs:
+    # the earliest-started wezterm-mux-server (if running) or wezterm-gui process. A map
+    # file older than that mux belongs to a previous generation and is ignored.
+    $muxOrigin = $null
+    try {
+        $muxOrigin = (Get-Process wezterm-mux-server, wezterm-gui -ErrorAction SilentlyContinue |
+            Sort-Object StartTime | Select-Object -First 1).StartTime
+    } catch { $muxOrigin = $null }
+
+    # Pick window: explicit, or the one containing the active pane
+    if ($WindowId -lt 0) {
+        $activePane = $panes | Where-Object { $_.is_active } | Select-Object -First 1
+        if (-not $activePane) {
+            $WindowId = ($panes | Select-Object -First 1).window_id
+        } else {
+            $WindowId = $activePane.window_id
+        }
+    }
+
+    $otherWindows = $panes | Where-Object { $_.window_id -ne $WindowId } | Select-Object -ExpandProperty window_id -Unique
+    if ($otherWindows) {
+        Write-Warning ("Saving window {0} only. Other windows ignored: {1}" -f $WindowId, ($otherWindows -join ', '))
+    }
+
+    $windowPanes = $panes | Where-Object { $_.window_id -eq $WindowId }
+
+    $tabs = Resolve-PaneEntries -WindowPanes $windowPanes -MuxOrigin $muxOrigin -ClaudeRoot (Join-Path $HOME '.claude')
     # Load existing manifest (preserve other profiles), or start fresh
     $manifest = $null
     if (Test-Path -LiteralPath $ManifestPath) {
@@ -567,5 +578,7 @@ function Test-SessionId {
 Set-Alias -Name claude-save    -Value Save-ClaudeSession
 Set-Alias -Name claude-restore -Value Restore-ClaudeSession
 
-Export-ModuleMember -Function Save-ClaudeSession, Restore-ClaudeSession, Get-ClaudeSession `
-                    -Alias claude-save, claude-restore
+if ($MyInvocation.MyCommand.ScriptBlock.Module) {
+    Export-ModuleMember -Function Save-ClaudeSession, Restore-ClaudeSession, Get-ClaudeSession `
+                        -Alias claude-save, claude-restore
+}
