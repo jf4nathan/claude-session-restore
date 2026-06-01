@@ -579,13 +579,23 @@ function Restore-ClaudeSession {
             $pwshCmd = if ($envSetup) { "$envSetup; . `$PROFILE" } else { ". `$PROFILE" }
 
             # Worktree-aware resume: a session that last worked in a git worktree still resumes from
-            # the repo root (so --resume can find it — Claude Code's resume is cwd-bound). Drop a
-            # one-shot marker so the SessionStart hook makes Claude auto re-enter the worktree on its
-            # first turn. No in-pane banner: Claude's TUI clears the screen on launch, so a pre-launch
-            # banner only flashes and vanishes. Skip if the worktree was pruned since save (nothing to
-            # switch into) or on -DryRun (keep dry runs side-effect-free).
-            if ($effectiveMode -eq 'resume' -and $pane.worktree -and -not $DryRun -and (Test-Path -LiteralPath $pane.worktree)) {
-                Set-WorktreeMarker -ClaudeRoot (Join-Path $HOME '.claude') -SessionId $resumeName -WorktreePath $pane.worktree | Out-Null
+            # the repo root (so --resume can find it — Claude Code's resume is cwd-bound), then
+            # re-enters the worktree itself. Two cooperating channels:
+            #   1. Inject CLAUDE_RESTORE_PROMPT='/switch-worktree' — the profile passes it as the
+            #      resumed session's positional first prompt, so Claude invokes the skill on resume
+            #      with no user input (zero-touch).
+            #   2. Drop a one-shot marker so the SessionStart hook's additionalContext names the exact
+            #      target worktree path (disambiguates which worktree) and acts as a fallback if the
+            #      profile doesn't consume the prompt var.
+            # No in-pane banner: Claude's TUI clears the screen on launch, so a pre-launch banner only
+            # flashes and vanishes. Skip both if the worktree was pruned since save (nothing to switch
+            # into). The prompt var is set even under -DryRun (it only shapes the previewed command);
+            # the marker write — a real side effect — is skipped on -DryRun.
+            if ($effectiveMode -eq 'resume' -and $pane.worktree -and (Test-Path -LiteralPath $pane.worktree)) {
+                $pwshCmd = "`$env:CLAUDE_RESTORE_PROMPT='/switch-worktree'; " + $pwshCmd
+                if (-not $DryRun) {
+                    Set-WorktreeMarker -ClaudeRoot (Join-Path $HOME '.claude') -SessionId $resumeName -WorktreePath $pane.worktree | Out-Null
+                }
             }
 
             # CRITICAL: pass the command as -EncodedCommand (base64 UTF-16 LE).
