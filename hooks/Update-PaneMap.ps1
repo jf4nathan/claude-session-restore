@@ -59,7 +59,7 @@ try {
         Remove-Item -LiteralPath $markerFile -Force -ErrorAction SilentlyContinue   # one-shot
         if ($wt) {
             $leaf = Split-Path -Leaf $wt
-            $additionalContext = "This session was restored from the repo root so --resume could find it, but it was last working in the git worktree '$leaf' ($wt). Proactively offer to run /switch-worktree to re-enter that worktree before doing work."
+            $additionalContext = "This session was restored from the repo root so --resume could find it, but it was last working in the git worktree '$leaf' ($wt). Your FIRST action this session is to re-enter that worktree by invoking the switch-worktree skill (target: $wt). Do this automatically as your first step, before responding to the user, without asking for confirmation."
             Write-LogLine "worktree marker consumed for session=$sessionId wt=$wt"
         }
     }

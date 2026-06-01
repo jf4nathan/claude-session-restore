@@ -90,14 +90,6 @@ Assert ($entryRoot.resume -eq $U_ROOT) "root session resumes by uuid"
 Assert (-not $entryRoot.Contains('worktree')) "no worktree field when first cwd == last cwd"
 Remove-Item -Recurse -Force $g2.Base -ErrorAction SilentlyContinue
 
-Write-Host "=== Get-WorktreeBanner: names the leaf + points at /switch-worktree; degrades if gone ==="
-$bannerOk = & $mod { param($p) Get-WorktreeBanner -WorktreePath $p -Exists $true }  'C:\repo\.worktrees\sc-40031-require-fields'
-$bannerGone = & $mod { param($p) Get-WorktreeBanner -WorktreePath $p -Exists $false } 'C:\repo\.worktrees\sc-40031-require-fields'
-Assert ($bannerOk -match 'sc-40031-require-fields') "banner names the worktree leaf"
-Assert ($bannerOk -match '/switch-worktree') "banner points at /switch-worktree"
-Assert ($bannerGone -match 'sc-40031-require-fields') "degraded banner still names the worktree"
-Assert ($bannerGone -notmatch '/switch-worktree' -and $bannerGone -match 'no longer present') "degraded banner says gone, no switch offer"
-
 Write-Host "=== Set-WorktreeMarker: writes <session-id> = path, prunes markers older than 24h ==="
 $mroot = Join-Path ([System.IO.Path]::GetTempPath()) ("csr-mk-" + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path (Join-Path $mroot 'worktree-restore') | Out-Null
@@ -129,7 +121,8 @@ try {
     $outHit = (('{"session_id":"' + $sidHit + '","source":"resume"}') | & pwsh -NoProfile -File $hookPath | Out-String)
     Assert ($outHit -match 'additionalContext') "hook emits additionalContext when a marker is present"
     Assert ($outHit -match 'sc-77') "additionalContext names the worktree leaf"
-    Assert ($outHit -match 'switch-worktree') "additionalContext mentions /switch-worktree"
+    Assert ($outHit -match 'switch-worktree') "additionalContext names the switch-worktree skill"
+    Assert ($outHit -match 'automatically' -and $outHit -match 'without asking') "additionalContext directs an automatic re-entry (not just an offer)"
     Assert (-not (Test-Path -LiteralPath (Join-Path $mkdir $sidHit))) "marker is deleted after emission (one-shot)"
 
     $sidMiss = '77777777-7777-4777-8777-777777777777'

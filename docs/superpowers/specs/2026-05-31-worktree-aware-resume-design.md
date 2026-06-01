@@ -44,15 +44,23 @@ break `--resume`).
 
 ## Goal / success criterion
 
-On restore of a case-2 session: claude resumes reliably **from root**, and the tool both
-(a) prints an in-pane banner naming the worktree, and (b) makes the resumed claude proactively
-**offer** `/switch-worktree`. We notify and offer; we do not force the switch, and we do not
-change resume/findability behavior.
+On restore of a case-2 session: claude resumes reliably **from root** (so `--resume` finds it),
+then **automatically re-enters the worktree on its first turn** via the `switch-worktree` skill —
+no manual step. We do not change resume/findability behavior.
 
-## Approach (selected: A — Save detects → manifest field → Restore banner + marker → hook offers)
+**Revision (2026-06-01):** the original design printed an in-pane banner + had the hook *offer*
+`/switch-worktree`. Live testing showed (a) the pre-launch banner is wiped when Claude's TUI clears
+the screen, so it only flashes; (b) a SessionStart offer is latent — Claude holds it in context but
+neither speaks nor acts until the user's first message, and even then only *offered*. So the user's
+restored pane sat in the root with nothing visible. Changed to: **no banner**, and the hook directs
+Claude to re-enter the worktree **automatically as its first action, without asking**. Still
+one-message latency (SessionStart context can't make Claude act before the user speaks), but it now
+switches instead of merely offering.
+
+## Approach (selected: A — Save detects → manifest field → Restore marker → hook auto-switches)
 
 Detection lives where the code already reads session jsonl (Save). The manifest carries a
-durable record. Restore emits the visible banner and a one-shot marker. The existing
+durable record. Restore writes a one-shot marker (no banner). The existing
 SessionStart hook turns the marker into an in-session offer. The banner still works even if the
 hook half is disabled.
 
@@ -83,15 +91,11 @@ absent for non-worktree panes. Backward-compatible: an older restore ignores unk
 For a `resume`-mode pane that has `worktree` (skip for fresh/continue):
 
 - Spawn cwd unchanged (root / `cleanCwd`).
-- **Banner:** inject a `Write-Host` line into the encoded inner pwsh command **before**
-  `. $PROFILE`, naming the worktree leaf and pointing at `/switch-worktree`. ASCII-only
-  (`[worktree] …`) — the spawned pane's output encoding is not guaranteed, and embedding raw
-  glyphs via the editor risks corruption.
-- **One-shot marker:** write `~/.claude/worktree-restore/<session-id>` containing the worktree
-  path. `<session-id>` is the `resume` id.
-- **Re-check at restore time:** if `worktree` no longer exists on disk (pruned since save),
-  print a degraded banner ("worktree <name> no longer present") and write **no** marker (so no
-  auto-offer for a gone worktree).
+- **One-shot marker:** write `~/.claude/worktree-restore/<session-id>` (the `resume` id) containing
+  the worktree path. No banner (the 2026-06-01 revision removed it — see Goal).
+- **Re-check at restore time:** if `worktree` no longer exists on disk (pruned since save), write
+  **no** marker (nothing to switch into; Claude just resumes in root).
+- **`-DryRun`:** write no marker.
 - **Hygiene:** prune marker files older than 24h when writing a new one.
 
 ### 4. Hook side (`hooks/Update-PaneMap.ps1`)
@@ -106,8 +110,9 @@ Check `~/.claude/worktree-restore/<session_id>`:
 
 - if present: emit `hookSpecificOutput.additionalContext` (instead of the bare `{}`) stating
   the session last worked in worktree `<path>`, that the terminal launched from root so
-  `--resume` could find the session, and that claude should proactively offer `/switch-worktree`
-  before doing work; then **delete the marker** (one-shot);
+  `--resume` could find the session, and that claude's **first action must be to re-enter that
+  worktree via the `switch-worktree` skill — automatically, before responding, without asking**;
+  then **delete the marker** (one-shot);
 - if absent: unchanged `{}` output.
 
 Marker presence is the sole gate, so the hook never misfires on normal/unrelated sessions. All
